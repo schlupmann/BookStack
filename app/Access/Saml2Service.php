@@ -8,11 +8,12 @@ use BookStack\Exceptions\StoppedAuthenticationException;
 use BookStack\Exceptions\UserRegistrationException;
 use BookStack\Users\Models\User;
 use Exception;
-use OneLogin\Saml2\Auth;
-use OneLogin\Saml2\Constants;
-use OneLogin\Saml2\Error;
-use OneLogin\Saml2\IdPMetadataParser;
-use OneLogin\Saml2\ValidationError;
+use SAML2\Binding;
+use SAML2\LogoutRequest;
+use SimpleSAML\Auth\Simple;
+use SimpleSAML\Store\StoreFactory;
+use SimpleSAML\Error\Exception as SimpleSAMLException;
+use SimpleSAML\Session;
 
 /**
  * Class Saml2Service
@@ -21,6 +22,7 @@ use OneLogin\Saml2\ValidationError;
 class Saml2Service
 {
     protected array $config;
+    private static $backChannelSessionId;
 
     public function __construct(
         protected RegistrationService $registrationService,
@@ -31,190 +33,262 @@ class Saml2Service
     }
 
     /**
-     * Initiate a login flow.
-     *
-     * @throws Error
+     * Initiate saml2 login
      */
-    public function login(): array
+    public function login()
     {
-        $toolKit = $this->getToolkit();
-        $returnRoute = url('/saml2/acs');
+        $auth = $this->getSimpleSAML();
 
-        return [
-            'url' => $toolKit->login($returnRoute, [], false, false, true),
-            'id'  => $toolKit->getLastRequestID(),
-        ];
+        $auth->login([
+            'ReturnTo' => url('/saml2/processAcs'),
+        ]);
+
+        return;
+    }
+
+    /**
+     * Process authentication after SAML login
+     */
+    public function processAuthentication()
+    {
+        $auth = $this->getSimpleSAML();
+
+        Session::getSessionFromRequest()->cleanup();
+
+        $user = $this->processLoginCallback(
+            $auth->getAuthData('saml:sp:NameID'),
+            $auth->getAttributes()
+        );
+
+        session()->put('saml2_session_index', $auth->getAuthData('saml:sp:SessionIndex'));
+
+        $userId = $user->external_auth_id;
+        $sessionId = session()->getId();
+        
+        $samlSession = Session::getSessionFromRequest();
+        $samlSession->setData('bookstack', 'bookstack_session', $sessionId);
+        $samlSession->setData('bookstack', 'user_id', $userId);
+        $samlSessionHandler = \SimpleSAML\SessionHandler::getSessionHandler();
+        $samlSessionHandler->saveSession($samlSession);
+        
+        \SimpleSAML\Session::getSessionFromRequest()->cleanup();
+
+        return $user;
     }
 
     /**
      * Initiate a logout flow.
      * Returns the SAML2 request ID, and the URL to redirect the user to.
      *
-     * @throws Error
+     * @throws SimpleSAMLException
      * @returns array{url: string, id: ?string}
      */
-    public function logout(User $user): array
+    public function logout(): array
     {
-        $toolKit = $this->getToolkit();
-        $sessionIndex = session()->get('saml2_session_index');
+        $auth = $this->getSimpleSAML();
         $returnUrl = url($this->loginService->logout());
 
-        try {
-            $url = $toolKit->logout(
-                $returnUrl,
-                [],
-                $user->email,
-                $sessionIndex,
-                true,
-                Constants::NAMEID_EMAIL_ADDRESS
-            );
-            $id = $toolKit->getLastRequestID();
-        } catch (Error $error) {
-            if ($error->getCode() !== Error::SAML_SINGLE_LOGOUT_NOT_SUPPORTED) {
-                throw $error;
-            }
-
-            $url = $returnUrl;
-            $id = null;
-        }
+        $url = $auth->getLogoutURL($returnUrl);
+        $id = session()->getId();
 
         return ['url' => $url, 'id' => $id];
     }
 
     /**
-     * Process the ACS response from the idp and return the
-     * matching, or new if registration active, user matched to the idp.
-     * Returns null if not authenticated.
-     *
-     * @throws Error
-     * @throws SamlException
-     * @throws ValidationError
-     * @throws JsonDebugException
-     * @throws UserRegistrationException
+     * Handle Single Logout Service requests
+     * Processes the logout request and returns appropriate response
+     * 
+     * @return mixed Response object from SimpleSAMLphp
      */
-    public function processAcsResponse(?string $requestId, string $samlResponse): ?User
+    public function handleSingleLogout()
     {
-        // The SAML2 toolkit expects the response to be within the $_POST superglobal
-        // so we need to manually put it back there at this point.
-        $_POST['SAMLResponse'] = $samlResponse;
-        $toolkit = $this->getToolkit();
-        $toolkit->processResponse($requestId);
-        $errors = $toolkit->getErrors();
+        global $sp_sessionId;
 
-        if (!empty($errors)) {
-            $reason = $toolkit->getLastErrorReason();
-            $message = 'Invalid ACS Response; Errors: ' . implode(', ', $errors);
-            $message .= $reason ? "; Reason: {$reason}" : '';
-            throw new Error($message);
+        try {
+            $config = \SimpleSAML\Configuration::getInstance();
+            $session = Session::getSessionFromRequest();
+            $spName = config('saml2.auth_source');
+            
+            // Check if we have an active session (front-channel)
+            $isFrontChannel = !is_null($session->getAuthState($spName));
+            
+            if ($isFrontChannel) {
+                // Register front-channel logout handler
+                $session->registerLogoutHandler($spName, 'BookStack\Access\Controllers\Saml2Controller', 'logoutFromIdpFrontChannel');
+            } else {
+                // Handle back-channel logout directly here
+                try {
+                    $binding = Binding::getCurrentBinding();
+                    $message = $binding->receive();
+                    
+                    if ($message instanceof LogoutRequest) {
+                        $nameId = $message->getNameId();
+                        $sessionIndexes = $message->getSessionIndexes();
+                
+                        $config = \SimpleSAML\Configuration::getInstance();
+                        $storeType = $config->getOptionalString('store.type', 'phpsession');
+                        $store = \SimpleSAML\Store\StoreFactory::getInstance($storeType);
+                
+                        $strNameId = serialize($nameId);
+                        $strNameId = sha1($strNameId);
+                        
+                        foreach ($sessionIndexes as &$sessionIndex) {
+                            if (is_string($sessionIndex) && strlen($sessionIndex) > 50) {
+                                $sessionIndex = sha1($sessionIndex);
+                            }
+                        }
+                        unset($sessionIndex);
+                
+                        if ($store instanceof \SimpleSAML\Store\SQLStore) {
+                            $params = [
+                                '_authSource' => $spName,
+                                '_nameId' => $strNameId,
+                            ];
+                            
+                            $query = 'SELECT _sessionId FROM ' . $store->prefix . '_saml_LogoutStore WHERE _authSource = :_authSource AND _nameId = :_nameId';
+                            $stmt = $store->pdo->prepare($query);
+                            $stmt->execute($params);
+                            $sessionId = $stmt->fetchColumn();
+                            
+                            if ($sessionId) {
+                                // Get the session and register the logout handler
+                                $foundSession = Session::getSession($sessionId);
+                                $foundSession->registerLogoutHandler($spName, 'BookStack\Access\Controllers\Saml2Controller', 'logoutFromIdpBackChannel');
+                                self::$backChannelSessionId = $sessionId;
+                            }
+                        } else {
+                            // Handle other store types if needed... NOT TESTED
+                            foreach ($sessionIndexes as $sessionIndex) {
+                                $sessionId = $store->get('saml.LogoutStore', $strNameId . ':' . $sessionIndex);
+                                if ($sessionId !== null && is_string($sessionId)) {
+                                    $foundSession = Session::getSession($sessionId);
+                                    $foundSession->registerLogoutHandler($spName, 'BookStack\Access\Controllers\Saml2Controller', 'logoutFromIdpBackChannel');
+                                    self::$backChannelSessionId = $sessionId;
+                                }
+                            }
+                        }
+                    }
+                } catch (\Exception $e) {
+                    // Only rethrow if it's not the "no binding found" error
+                    if ($e->getMessage() !== 'Unable to find the current binding.') {
+                        throw $e;
+                    }
+                }
+            }
+            
+            // Forward to SimpleSAMLphp SLO handler and get response
+            $serviceProvider = new \SimpleSAML\Module\saml\Controller\ServiceProvider($config, $session);
+            return $serviceProvider->singleLogoutService($spName);
+           
+        } catch (\Exception $e) {
+            throw $e;
         }
-
-        if (!$toolkit->isAuthenticated()) {
-            return null;
-        }
-
-        $attrs = $toolkit->getAttributes();
-        $id = $toolkit->getNameId();
-        session()->put('saml2_session_index', $toolkit->getSessionIndex());
-
-        return $this->processLoginCallback($id, $attrs);
     }
 
-    /**
-     * Process a response for the single logout service.
+
+     /**
+     * Process a SOAP logout.
      *
-     * @throws Error
      */
-    public function processSlsResponse(?string $requestId): string
-    {
-        $toolkit = $this->getToolkit();
 
-        // The $retrieveParametersFromServer in the call below will mean the library will take the query
-        // parameters, used for the response signing, from the raw $_SERVER['QUERY_STRING']
-        // value so that the exact encoding format is matched when checking the signature.
-        // This is primarily due to ADFS encoding query params with lowercase percent encoding while
-        // PHP (And most other sensible providers) standardise on uppercase.
-        /** @var ?string $samlRedirect */
-        $samlRedirect = $toolkit->processSLO(true, $requestId, true, null, true);
-        $errors = $toolkit->getErrors();
+     public static function logoutFromIdpBackChannel(): void
+     {
 
-        if (!empty($errors)) {
-            throw new Error(
-                'Invalid SLS Response: ' . implode(', ', $errors)
-            );
+        $sp_sessionId = self::$backChannelSessionId;
+
+        if (isset($sp_sessionId)) {
+            $config = \SimpleSAML\Configuration::getInstance();
+            $storeType = $config->getOptionalString('store.type', 'sql');
+            $store = StoreFactory::getInstance($storeType);
+
+            $session = Session::getSession($sp_sessionId);
+
+            $bookstack_sessionId = $session->getData('bookstack', 'bookstack_session');
+
+            if ($store instanceof \SimpleSAML\Store\SQLStore) {
+                $store->delete('session', $sp_sessionId);
+            }
+
+            $session->cleanup();
+
+            if ($bookstack_sessionId) {
+                try {
+                    $pdo = null;
+                    
+                    if (class_exists('\Illuminate\Support\Facades\DB')) {
+                        try {
+                            $pdo = \Illuminate\Support\Facades\DB::connection()->getPdo();
+                        } catch (\Exception $e) {
+                            // Connection error handling
+                        }
+                    }
+
+                    $stmt = $pdo->prepare("SELECT id FROM sessions WHERE id = :id");
+                    $stmt->execute(['id' => $bookstack_sessionId]);
+                    $sessionExists = $stmt->fetchColumn() !== false;
+                    
+                    if ($sessionExists) {
+                        // Get user ID from SAML session data
+                        $userId = $session->getData('bookstack', 'user_id');
+                        
+                        // Delete the session
+                        $stmt = $pdo->prepare("DELETE FROM sessions WHERE id = :id");
+                        $stmt->execute(['id' => $bookstack_sessionId]);
+                        
+                        // Also reset user's remember token if we have their ID
+                        if ($userId) {
+                            $stmt = $pdo->prepare("UPDATE users SET remember_token = NULL WHERE external_auth_id = :id");
+                            $stmt->execute(['id' => $userId]);
+                        }
+                    }
+                } catch (\Exception $e) {
+                    // Error handling
+                }
+            }
         }
-
-        $defaultBookStackRedirect = $this->loginService->logout();
-
-        return $samlRedirect ?? $defaultBookStackRedirect;
-    }
+     }
 
     /**
      * Get the metadata for this service provider.
      *
-     * @throws Error
+     * @throws SimpleSAMLException
      */
     public function metadata(): string
     {
-        $toolKit = $this->getToolkit(true);
-        $settings = $toolKit->getSettings();
-        $metadata = $settings->getSPMetadata();
-        $errors = $settings->validateMetadata($metadata);
-
-        if (!empty($errors)) {
-            throw new Error(
-                'Invalid SP metadata: ' . implode(', ', $errors),
-                Error::METADATA_SP_INVALID
-            );
+        try {
+            // Get auth source name
+            $authSource = $this->config['auth_source'];
+            
+            // Get the SP auth source
+            $source = \SimpleSAML\Auth\Source::getById($authSource);
+            if (!($source instanceof \SimpleSAML\Module\saml\Auth\Source\SP)) {
+                throw new SimpleSAMLException('Auth source is not a SAML SP');
+            }
+            
+            // Get the metadata URL directly from the SP source
+            $metadataUrl = $source->getMetadataURL();
+            $metadata = file_get_contents($metadataUrl);
+            if (!$metadata) {
+                throw new SimpleSAMLException('Failed to fetch metadata from ' . $metadataUrl);
+            }
+            
+            return $metadata;
+            
+        } catch (\Exception $e) {
+            throw new SimpleSAMLException('Error retrieving metadata: ' . $e->getMessage());
         }
-
-        return $metadata;
     }
 
     /**
-     * Load the underlying Onelogin SAML2 toolkit.
+     * Load the SimpleSAMLphp instance.
      *
-     * @throws Error
-     * @throws Exception
+     * @throws SimpleSAMLException
      */
-    protected function getToolkit(bool $spOnly = false): Auth
+    protected function getSimpleSAML(): Simple
     {
-        $settings = $this->config['onelogin'];
-        $overrides = $this->config['onelogin_overrides'] ?? [];
+        $authSource = $this->config['auth_source'];
 
-        if ($overrides && is_string($overrides)) {
-            $overrides = json_decode($overrides, true);
-        }
-
-        $metaDataSettings = [];
-        if (!$spOnly && $this->config['autoload_from_metadata']) {
-            $metaDataSettings = IdPMetadataParser::parseRemoteXML($settings['idp']['entityId']);
-        }
-
-        $spSettings = $this->loadOneloginServiceProviderDetails();
-        $settings = array_replace_recursive($settings, $spSettings, $metaDataSettings, $overrides);
-
-        return new Auth($settings, $spOnly);
-    }
-
-    /**
-     * Load dynamic service provider options required by the onelogin toolkit.
-     */
-    protected function loadOneloginServiceProviderDetails(): array
-    {
-        $spDetails = [
-            'entityId'                 => url('/saml2/metadata'),
-            'assertionConsumerService' => [
-                'url' => url('/saml2/acs'),
-            ],
-            'singleLogoutService' => [
-                'url' => url('/saml2/sls'),
-            ],
-        ];
-
-        return [
-            'baseurl' => url('/saml2'),
-            'sp'      => $spDetails,
-        ];
+        return new Simple($authSource);
     }
 
     /**
