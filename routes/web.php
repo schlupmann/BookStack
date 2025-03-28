@@ -345,13 +345,12 @@ Route::post('/register', [AccessControllers\RegisterController::class, 'postRegi
 Route::post('/saml2/login', [AccessControllers\Saml2Controller::class, 'login']);
 Route::post('/saml2/logout', [AccessControllers\Saml2Controller::class, 'logout']);
 Route::get('/saml2/metadata', [AccessControllers\Saml2Controller::class, 'metadata']);
-Route::get('/saml2/sls', [AccessControllers\Saml2Controller::class, 'sls']);
-Route::post('/saml2/acs', [AccessControllers\Saml2Controller::class, 'startAcs'])->withoutMiddleware([
+Route::match(['get', 'post'], '/saml2/sls', [AccessControllers\Saml2Controller::class, 'singleLogoutService'])->withoutMiddleware([
     StartSession::class,
     ShareErrorsFromSession::class,
     VerifyCsrfToken::class,
 ]);
-Route::get('/saml2/acs', [AccessControllers\Saml2Controller::class, 'processAcs']);
+Route::match(['get', 'post'], '/saml2/processAcs', [AccessControllers\Saml2Controller::class, 'processAcs']);
 
 // OIDC routes
 Route::post('/oidc/login', [AccessControllers\OidcController::class, 'login']);
